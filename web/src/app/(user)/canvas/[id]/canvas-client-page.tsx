@@ -15,7 +15,7 @@ import { createVideoGenerationTask, pollVideoGenerationTaskStatus, VIDEO_POLL_IN
 import { comfyOutputStorageKey, getWorkflowTask, submitWorkflowTask, workflowMediaSource, type WorkflowGenerationTask } from "@/services/api/workflow-generation";
 import type { WorkflowRef } from "@/lib/workflow-channel";
 import { channelProtocolForConfig, defaultConfig, resolveModelForCapability, type AiConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { collectImageStorageKeys, deleteImagePreviews, deleteStoredImages, deleteUnusedImagePreviews, ensureImagePreview, resolveImageUrl, uploadImage, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
+import { collectImageStorageKeys, deleteImagePreviews, deleteStoredImages, deleteUnusedImagePreviews, ensureImagePreview, resolveImageUrl, uploadImage, uploadImageToImgbed, uploadRemoteImageToServer, type UploadedImage } from "@/services/image-storage";
 import { uploadAnonymousTemporaryFile } from "@/services/anonymous-storage";
 import { downloadRemoteMedia, readVideoMeta, resolveMediaUrl, uploadMediaFile, uploadRemoteMediaToServer, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
@@ -2502,13 +2502,19 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             const video = containerRef.current?.querySelector<HTMLVideoElement>(`[data-node-id="${CSS.escape(nodeId)}"] video`);
             if (node?.type !== CanvasNodeType.Video || !node.metadata?.content || !video) return message.error("无法截取该画面，请重试");
             try {
-                const image = await uploadImage(await captureVideoFrame(node.metadata.content, position, video.currentTime));
+                const frame = await captureVideoFrame(node.metadata.content, position, video.currentTime);
+                const frameName = position === "first" ? "首帧" : position === "last" ? "尾帧" : "当前帧";
+                let image: UploadedImage;
+                try {
+                    image = await uploadImageToImgbed(frame, `${node.title || "视频"} ${frameName}`);
+                } catch {
+                    image = await uploadImage(frame);
+                }
                 const size = fitNodeSize(image.width, image.height, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT);
                 const id = nanoid();
                 const x = node.position.x + node.width + 96;
                 let y = node.position.y + node.height / 2 - size.height / 2;
                 while (nodesRef.current.some((item) => item.id !== node.id && item.position.x < x + size.width && item.position.x + item.width > x && item.position.y < y + size.height && item.position.y + item.height > y)) y += size.height + 24;
-                const frameName = position === "first" ? "首帧" : position === "last" ? "尾帧" : "当前帧";
                 const child: CanvasNodeData = {
                     id,
                     type: CanvasNodeType.Image,

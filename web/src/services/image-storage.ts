@@ -389,6 +389,32 @@ export async function uploadImage(input: string | Blob, options: UploadImageOpti
     return { url: urlObj, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type || meta.mimeType };
 }
 
+const IMGBED_UPLOAD_ENDPOINT = "http://127.0.0.1:23211/upload";
+
+/** 画布截帧等本地图片直接推 GitHub 图床（经本机 imgbed 桥 23211），返回 jsDelivr 永久直链 */
+export async function uploadImageToImgbed(blob: Blob, filename: string): Promise<UploadedImage> {
+    const dataUrl = await blobToDataUrl(blob);
+    const response = await fetch(IMGBED_UPLOAD_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data_url: dataUrl, filename }),
+    });
+    if (!response.ok) throw new Error(`图床上传失败：${response.status}`);
+    const payload = await response.json().catch(() => null) as { ok?: boolean; url?: string; error?: string } | null;
+    if (!payload?.ok || !payload.url) throw new Error(payload?.error || "图床上传失败");
+    let width = 0;
+    let height = 0;
+    try {
+        const bitmap = await createImageBitmap(blob);
+        width = bitmap.width;
+        height = bitmap.height;
+        bitmap.close();
+    } catch {
+        // 尺寸读取失败不阻塞上传
+    }
+    return { url: payload.url, storageKey: "", width, height, bytes: blob.size, mimeType: blob.type || "image/png" };
+}
+
 export async function uploadRemoteImageToServer(url: string, filename: string): Promise<UploadedImage> {
     const response = await fetch(getProxyUrl(url));
     if (!response.ok) {
