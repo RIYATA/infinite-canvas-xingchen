@@ -7,6 +7,7 @@ import { deleteImagePreviews } from "@/services/image-storage";
 import { listCanvasProjects, saveCanvasProject, syncCanvasProjects } from "@/services/api/canvas-tasks";
 import { fetchUserConfig } from "@/services/api/user-config";
 import { useUserStore } from "@/stores/use-user-store";
+import { useCanvasSaveStore } from "./use-canvas-save-store";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasAgentConfig, CanvasAssistantSession, CanvasConnection, CanvasNodeData, CanvasPendingAgentRequest, ViewportTransform } from "../types";
 
@@ -53,12 +54,23 @@ type CanvasStore = {
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
 const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects">;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let saveTimerHandle: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
 let accountCanvasSyncEnabled = false;
 const projectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingProjectSaves = new Map<string, { token: string; project: CanvasProject }>();
+const failedProjectSaves = new Map<string, { token: string; project: CanvasProject }>();
 const savingProjects = new Set<string>();
+
+const CANVAS_SNAPSHOT_PREFIX = "infinite-canvas:canvas_snapshots:";
+const CANVAS_SNAPSHOT_LIMIT = 5;
+
+export type CanvasProjectSnapshot = { at: string; signature: string; project: CanvasProject };
+
+export function canvasProjectSignature(project: CanvasProject): string {
+    const contentSize = (project.nodes || []).reduce((total, node) => total + (node.metadata?.content?.length || 0), 0);
+    return [project.title, project.nodes?.length || 0, project.connections?.length || 0, project.chatSessions?.length || 0, contentSize].join("|");
+}
 
 function waitForUserStoreHydration() {
     if (useUserStore.persist.hasHydrated()) return Promise.resolve();
@@ -83,9 +95,33 @@ async function flushProjectSave(id: string) {
     if (!pending || !accountCanvasSyncEnabled || useUserStore.getState().token !== pending.token) return;
 
     savingProjects.add(id);
-    await saveCanvasProject(pending.token, pending.project).catch(() => undefined);
+    useCanvasSaveStore.getState().markSaving();
+    try {
+        await saveCanvasProject(pending.token, pending.project);
+        useCanvasSaveStore.getState().markSaved();
+    } catch (error) {
+        // 保存失败也不丢失：放入失败队列，交给自动保存定时重试，避免立刻死循环
+        failedProjectSaves.set(id, pending);
+        console.warn("[canvas] 画布保存失败，已进入自动重试队列", id, error);
+    }
     savingProjects.delete(id);
+    if (failedProjectSaves.has(id)) return;
     void flushProjectSave(id);
+}
+
+function retryFailedProjectSaves() {
+    if (!failedProjectSaves.size) return 0;
+    const token = useUserStore.getState().token;
+    let count = 0;
+    failedProjectSaves.forEach((pending, id) => {
+        failedProjectSaves.delete(id);
+        if (!accountCanvasSyncEnabled || token !== pending.token) return;
+        if (!pendingProjectSaves.has(id) && !savingProjects.has(id)) {
+            pendingProjectSaves.set(id, pending);
+            count += 1;
+        }
+    });
+    return count;
 }
 
 function queueProjectSave(project: CanvasProject) {
@@ -95,9 +131,11 @@ function queueProjectSave(project: CanvasProject) {
     projectSaveTimers.delete(project.id);
     if (!token || !accountCanvasSyncEnabled) {
         pendingProjectSaves.delete(project.id);
+        useCanvasSaveStore.getState().markDirty();
         return;
     }
     pendingProjectSaves.set(project.id, { token, project });
+    useCanvasSaveStore.getState().markDirty();
     projectSaveTimers.set(
         project.id,
         setTimeout(() => {
@@ -105,6 +143,70 @@ function queueProjectSave(project: CanvasProject) {
             void flushProjectSave(project.id);
         }, 400),
     );
+}
+
+export function flushCanvasSavesNow() {
+    retryFailedProjectSaves();
+    const ids = Array.from(new Set([...projectSaveTimers.keys(), ...pendingProjectSaves.keys()]));
+    ids.forEach((id) => {
+        const timer = projectSaveTimers.get(id);
+        if (timer) clearTimeout(timer);
+        projectSaveTimers.delete(id);
+    });
+    ids.forEach((id) => void flushProjectSave(id));
+    return ids.length;
+}
+
+export async function persistCanvasStateNow() {
+    if (typeof window === "undefined") return;
+    const state = useCanvasStore.getState();
+    const nextState: PersistedCanvasState = { projects: state.projects };
+    queuedPersistState = nextState;
+    if (saveTimerHandle) {
+        clearTimeout(saveTimerHandle);
+        saveTimerHandle = null;
+    }
+    const statusBefore = useCanvasSaveStore.getState().status;
+    try {
+        await localForageStorage.setItem(CANVAS_STORE_KEY, JSON.stringify({ state: { projects: state.projects }, version: 0 }));
+        if (statusBefore !== "saved" && statusBefore !== "idle") {
+            useCanvasSaveStore.getState().markSaved();
+        }
+    } catch (error) {
+        console.warn("[canvas] 本地保存失败", error);
+        useCanvasSaveStore.getState().markError();
+    }
+}
+
+export async function writeProjectSnapshot(projectId: string) {
+    const project = useCanvasStore.getState().projects.find((item) => item.id === projectId);
+    if (!project) return false;
+    const signature = canvasProjectSignature(project);
+    const key = CANVAS_SNAPSHOT_PREFIX + projectId;
+    try {
+        const raw = await localForageStorage.getItem(key);
+        const parsed = raw ? (JSON.parse(raw as string) as { versions?: CanvasProjectSnapshot[] }) : {};
+        const versions = parsed.versions || [];
+        if (versions[0]?.signature === signature) return false;
+        versions.unshift({ at: new Date().toISOString(), signature, project });
+        while (versions.length > CANVAS_SNAPSHOT_LIMIT) versions.pop();
+        await localForageStorage.setItem(key, JSON.stringify({ versions }));
+        return true;
+    } catch (error) {
+        console.warn("[canvas] 写入画布快照失败", error);
+        return false;
+    }
+}
+
+export async function listProjectSnapshots(projectId: string): Promise<CanvasProjectSnapshot[]> {
+    try {
+        const raw = await localForageStorage.getItem(CANVAS_SNAPSHOT_PREFIX + projectId);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw as string) as { versions?: CanvasProjectSnapshot[] };
+        return parsed.versions || [];
+    } catch {
+        return [];
+    }
 }
 
 function cancelProjectSaves(ids: string[]) {
@@ -238,9 +340,11 @@ const canvasStorage: PersistStorage<CanvasStore> = {
             return;
         }
         queuedPersistState = nextState;
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => {
-            saveTimer = null;
+        const saveStatus = useCanvasSaveStore.getState();
+        if (saveStatus.status === "saved" || saveStatus.status === "idle") saveStatus.markDirty();
+        if (saveTimerHandle) clearTimeout(saveTimerHandle);
+        saveTimerHandle = setTimeout(() => {
+            saveTimerHandle = null;
             void localForageStorage.setItem(name, JSON.stringify(value));
         }, 400);
     },
@@ -367,9 +471,9 @@ export const useCanvasStore = create<CanvasStore>()(
                     remoteProjects,
                     localProjects,
                 );
-                if (saveTimer) {
-                    clearTimeout(saveTimer);
-                    saveTimer = null;
+                if (saveTimerHandle) {
+                    clearTimeout(saveTimerHandle);
+                    saveTimerHandle = null;
                 }
                 const nextState = { projects };
                 queuedPersistState = nextState;

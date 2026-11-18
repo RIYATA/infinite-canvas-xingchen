@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import dynamic from "next/dynamic";
 import { useParams, useRouter } from "next/navigation";
-import { ChevronLeft, ChevronRight, Download, Globe2, Home, ImageIcon, Images, Layers3, List, Maximize, Menu, Bot, Music2, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, Redo2, Settings2, Trash2, Undo2, Upload, Video, Volume2, VolumeX, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, Globe2, History, Home, ImageIcon, Images, Layers3, List, Maximize, Menu, Bot, Music2, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, Redo2, Settings2, Trash2, Undo2, Upload, Video, Volume2, VolumeX, X } from "lucide-react";
 import { saveAs } from "file-saver";
 
 import { deleteCanvasProjects, stopCanvasTask } from "@/services/api/canvas-tasks";
@@ -74,6 +74,9 @@ import { AssetPickerModal, type AssetPickerTab } from "../components/asset-picke
 import { CanvasZoomControls } from "../components/canvas-zoom-controls";
 import { CANVAS_ASSET_DRAG_TYPE, CanvasSidePanel } from "../components/canvas-side-panel";
 import { DEFAULT_CANVAS_AGENT_PANEL, DEFAULT_CANVAS_SIDE_PANEL, useCanvasStore } from "../stores/use-canvas-store";
+import { useCanvasSaveStore } from "../stores/use-canvas-save-store";
+import { useCanvasAutosave } from "../hooks/use-canvas-autosave";
+import { CanvasSnapshotDialog } from "../components/canvas-snapshot-dialog";
 import { useCanvasUiStore } from "../stores/use-canvas-ui-store";
 import { assistantReferenceContentFromNode, buildNodeMentionReferences, isCanvasReferenceNode } from "../utils/canvas-resource-references";
 import { buildCanvasAgentContext } from "../agent/canvas-agent-context";
@@ -375,6 +378,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     const updateProject = useCanvasStore((state) => state.updateProject);
     const renameProject = useCanvasStore((state) => state.renameProject);
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
+    const importProject = useCanvasStore((state) => state.importProject);
     const currentProject = useCanvasStore((state) => state.projects.find((project) => project.id === projectId));
     const colorTheme = useThemeStore((state) => state.theme);
     const theme = canvasThemes[colorTheme];
@@ -405,6 +409,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     const [showImageInfo, setShowImageInfo] = useState(false);
     const [sidePanel, setSidePanel] = useState(() => DEFAULT_CANVAS_SIDE_PANEL);
     const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+    const [snapshotRestoreOpen, setSnapshotRestoreOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
     const [assetPickerTab, setAssetPickerTab] = useState<AssetPickerTab>("my-assets");
     const [pendingPanoramaImport, setPendingPanoramaImport] = useState<PendingPanoramaImport | null>(null);
@@ -682,6 +687,8 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         };
         void restore();
     }, [hydrated, openProject, projectId, router]);
+
+    useCanvasAutosave(projectId, projectLoaded);
 
     useEffect(() => {
         if (!projectLoaded) return;
@@ -4560,10 +4567,22 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     onImportImage={() => handleUploadRequest()}
                     onUndo={undoCanvas}
                     onRedo={redoCanvas}
+                    onOpenSnapshots={() => setSnapshotRestoreOpen(true)}
                     assistantCollapsed={!agentPanel.open}
                     onExpandAssistant={() => {
                         setAssistantMounted(true);
                         setAgentPanel((current) => ({ ...current, open: true }));
+                    }}
+                />
+
+                <CanvasSnapshotDialog
+                    projectId={projectId}
+                    open={snapshotRestoreOpen}
+                    onClose={() => setSnapshotRestoreOpen(false)}
+                    onRestore={(project) => {
+                        const restoredId = importProject(project);
+                        setSnapshotRestoreOpen(false);
+                        router.push(`/canvas/${restoredId}`);
                     }}
                 />
 
@@ -5310,6 +5329,32 @@ function FullscreenPreview({ src, alt, isVideo, isPanorama, proxyGeneratedPanora
     );
 }
 
+function CanvasSaveBadge() {
+    const status = useCanvasSaveStore((state) => state.status);
+    const lastSavedAt = useCanvasSaveStore((state) => state.lastSavedAt);
+    const colorTheme = useThemeStore((state) => state.theme);
+    const badgeTheme = canvasThemes[colorTheme];
+    if (status === "idle") return null;
+    const savedAtText = lastSavedAt ? ` ${new Date(lastSavedAt).toLocaleTimeString("zh-CN", { hour12: false })}` : "";
+    const text =
+        status === "saving"
+            ? "自动保存中…"
+            : status === "error"
+              ? "保存失败 · 自动重试中"
+              : status === "dirty"
+                ? "待自动保存"
+                : `已自动保存${savedAtText}`;
+    return (
+        <span
+            className="hidden shrink-0 text-xs md:inline"
+            style={{ color: status === "error" ? "#f87171" : badgeTheme.node.muted }}
+            title="画布每 15 秒自动保存到本地与服务器，关闭页面前会立即保存；可在画布菜单「恢复历史快照」找回之前的内容。"
+        >
+            {text}
+        </span>
+    );
+}
+
 function CanvasTopBar({
     title,
     sidePanelOpen,
@@ -5329,6 +5374,7 @@ function CanvasTopBar({
     onImportImage,
     onUndo,
     onRedo,
+    onOpenSnapshots,
     assistantCollapsed,
     onExpandAssistant,
 }: {
@@ -5350,6 +5396,7 @@ function CanvasTopBar({
     onImportImage: () => void;
     onUndo: () => void;
     onRedo: () => void;
+    onOpenSnapshots: () => void;
     assistantCollapsed: boolean;
     onExpandAssistant: () => void;
 }) {
@@ -5394,6 +5441,7 @@ function CanvasTopBar({
                                 { type: "divider" },
                                 { key: "new", icon: <Plus className="size-4" />, label: "新建画布", onClick: onCreateProject },
                                 { key: "delete", danger: true, icon: <Trash2 className="size-4" />, label: "删除当前画布", onClick: onDeleteProject },
+                                { key: "snapshots", icon: <History className="size-4" />, label: "恢复历史快照", onClick: onOpenSnapshots },
                                 { type: "divider" },
                                 { key: "import", icon: <Upload className="size-4" />, label: "导入素材", onClick: onImportImage },
                                 { type: "divider" },
@@ -5432,6 +5480,8 @@ function CanvasTopBar({
                             </button>
                         )}
                     </div>
+
+                    <CanvasSaveBadge />
                 </div>
 
                 <div className="pointer-events-auto flex items-center gap-1.5">
